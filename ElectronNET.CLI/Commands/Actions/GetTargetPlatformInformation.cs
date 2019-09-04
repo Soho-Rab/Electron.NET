@@ -1,7 +1,5 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Runtime.InteropServices;
-using System.Text;
 
 namespace ElectronNET.CLI.Commands.Actions
 {
@@ -23,11 +21,11 @@ namespace ElectronNET.CLI.Commands.Actions
             {
                 case "win":
                     netCorePublishRid = "win-x64";
-                    electronPackerPlatform = "win32";
+                    electronPackerPlatform = "win";
                     break;
                 case "osx":
                     netCorePublishRid = "osx-x64";
-                    electronPackerPlatform = "darwin";
+                    electronPackerPlatform = "mac";
                     break;
                 case "linux":
                     netCorePublishRid = "linux-x64";
@@ -45,13 +43,13 @@ namespace ElectronNET.CLI.Commands.Actions
                 default:
                     if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                     {
-                        netCorePublishRid = "win-x64";
-                        electronPackerPlatform = "win32";
+                        netCorePublishRid = $"win-x{(Environment.Is64BitOperatingSystem ? "64" : "86")}";
+                        electronPackerPlatform = "win";
                     }
                     if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
                     {
                         netCorePublishRid = "osx-x64";
-                        electronPackerPlatform = "darwin";
+                        electronPackerPlatform = "mac";
                     }
                     if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
                     {

@@ -1,21 +1,30 @@
 ﻿const { app } = require('electron');
-const { BrowserWindow, dialog, shell } = require('electron');
-const fs = require('fs');
+const { BrowserWindow } = require('electron');
 const path = require('path');
 const process = require('child_process').spawn;
-const portfinder = require('detect-port');
-let io, browserWindows, ipc, apiProcess, loadURL;
+const portscanner = require('portscanner');
+const imageSize = require('image-size');
+let io, server, browserWindows, ipc, apiProcess, loadURL;
 let appApi, menu, dialogApi, notification, tray, webContents;
-let globalShortcut, shellApi, screen, clipboard;
-let splashScreen, mainWindowId;
+let globalShortcut, shellApi, screen, clipboard, autoUpdater;
+let splashScreen, hostHook;
 
-const manifestJsonFile = require('./bin/electron.manifest.json');
-if (manifestJsonFile.singleInstance) {
-    const shouldQuit = app.makeSingleInstance((commandLine, workingDirectory) => {
-        mainWindowId && BrowserWindow.fromId(mainWindowId) && BrowserWindow.fromId(mainWindowId).show();
+const currentBinPath = path.join(__dirname.replace('app.asar', ''), 'bin');
+const manifestJsonFilePath = path.join(currentBinPath, 'electron.manifest.json');
+const manifestJsonFile = require(manifestJsonFilePath);
+if (manifestJsonFile.singleInstance || manifestJsonFile.aspCoreBackendPort) {
+    const mainInstance = app.requestSingleInstanceLock();
+    app.on('second-instance', () => {
+        const windows = BrowserWindow.getAllWindows();
+        if (windows.length) {
+            if (windows[0].isMinimized()) {
+                windows[0].restore();
+            }
+            windows[0].focus();
+        }
     });
 
-    if (shouldQuit) {
+    if (!mainInstance) {
         app.quit();
     }
 }
@@ -25,47 +34,74 @@ app.on('ready', () => {
         startSplashScreen();
     }
 
-    portfinder(8000, (error, port) => {
+    // hostname needs to belocalhost, otherwise Windows Firewall will be triggered.
+    portscanner.findAPortNotInUse(8000, 65535, 'localhost', function (error, port) {
+        console.log('Electron Socket IO Port: ' + port);
         startSocketApiBridge(port);
     });
+
 });
 
 function isSplashScreenEnabled() {
-    return Boolean(manifestJsonFile.loadingUrl);
+    if (manifestJsonFile.hasOwnProperty('splashscreen')) {
+        if (manifestJsonFile.splashscreen.hasOwnProperty('imageFile')) {
+            return Boolean(manifestJsonFile.splashscreen.imageFile);
+        }
+    }
+
+    return false;
 }
 
 function startSplashScreen() {
-    let loadingUrl = manifestJsonFile.loadingUrl;
-    let icon = manifestJsonFile.icon;
+    let imageFile = path.join(currentBinPath, manifestJsonFile.splashscreen.imageFile);
+    imageSize(imageFile, (error, dimensions) => {
+        if (error) {
+            console.log(`load splashscreen error:`);
+            console.log(error);
 
-    if (loadingUrl) {
-        splashScreen = new BrowserWindow({
-            width: manifestJsonFile.width,
-            height: manifestJsonFile.height,
-            transparent: true,
-            frame: false,
-            show: false,
-            icon: path.join(__dirname, icon)
-        });
-
-        if (manifestJsonFile.devTools) {
-            splashScreen.webContents.openDevTools();
+            throw new Error(error.message);
         }
 
-        splashScreen.loadURL(loadingUrl);
-        splashScreen.once('ready-to-show', () => {
-            splashScreen.show();
+        splashScreen = new BrowserWindow({
+            width: dimensions.width,
+            height: dimensions.height,
+            transparent: true,
+            center: true,
+            frame: false,
+            alwaysOnTop: true,
+            skipTaskbar: true,
+            show: true
         });
 
-        splashScreen.on('closed', () => {
+        app.once('browser-window-focus', () => {
+            app.once('browser-window-focus', () => {
+                splashScreen.destroy();
+            });
+        });
+
+        const loadSplashscreenUrl = path.join(__dirname, 'splashscreen', 'index.html') + '?imgPath=' + imageFile;
+        splashScreen.loadURL('file://' + loadSplashscreenUrl);
+
+        splashScreen.once('closed', () => {
             splashScreen = null;
         });
-    }
+    });
 }
 
 function startSocketApiBridge(port) {
-    io = require('socket.io')(port);
-    startAspCoreBackend(port);
+
+    // instead of 'require('socket.io')(port);' we need to use this workaround
+    // otherwise the Windows Firewall will be triggered
+    server = require('http').createServer();
+    io = require('socket.io')();
+    io.attach(server);
+
+    server.listen(port, 'localhost');
+    server.on('listening', function () {
+        console.log('Electron Socket started on port %s at %s', server.address().port, server.address().address);
+        // Now that socket connection is established, we can guarantee port will not be open for portscanner
+        startAspCoreBackend(port);
+    });
 
     io.on('connection', (socket) => {
         global['electronsocket'] = socket;
@@ -73,7 +109,8 @@ function startSocketApiBridge(port) {
         console.log('ASP.NET Core Application connected...', 'global.electronsocket', global['electronsocket'].id, new Date());
 
         appApi = require('./api/app')(socket, app);
-        browserWindows = require('./api/browserWindows')(socket);
+        browserWindows = require('./api/browserWindows')(socket, app);
+        autoUpdater = require('./api/autoUpdater')(socket);
         ipc = require('./api/ipc')(socket);
         menu = require('./api/menu')(socket);
         dialogApi = require('./api/dialog')(socket);
@@ -85,16 +122,42 @@ function startSocketApiBridge(port) {
         screen = require('./api/screen')(socket);
         clipboard = require('./api/clipboard')(socket);
 
-        if (splashScreen && !splashScreen.isDestroyed()) {
-            splashScreen.close();
+        try {
+            const hostHookScriptFilePath = path.join(__dirname, 'ElectronHostHook', 'index.js');
+
+            if (isModuleAvailable(hostHookScriptFilePath) && hostHook === undefined) {
+                const { HookService } = require(hostHookScriptFilePath);
+                hostHook = new HookService(socket, app);
+                hostHook.onHostReady();
+            }
+        } catch (error) {
+            console.log(error.message);
         }
     });
 }
 
+function isModuleAvailable(name) {
+    try {
+        require.resolve(name);
+        return true;
+    } catch (e) { }
+    return false;
+}
+
 function startAspCoreBackend(electronPort) {
-    portfinder(8000, (error, electronWebPort) => {
-        loadURL = `http://localhost:${electronWebPort}`
-        const parameters = [`/electronPort=${electronPort}`, `/electronWebPort=${electronWebPort}`];
+    if(manifestJsonFile.aspCoreBackendPort) {
+        startBackend(manifestJsonFile.aspCoreBackendPort)
+    } else {
+        // hostname needs to be localhost, otherwise Windows Firewall will be triggered.
+        portscanner.findAPortNotInUse(8000, 65535, 'localhost', function (error, electronWebPort) {
+            startBackend(electronWebPort);
+        });
+    }
+
+    function startBackend(aspCoreBackendPort) {
+        console.log('ASP.NET Core Port: ' + aspCoreBackendPort);
+        loadURL = `http://localhost:${aspCoreBackendPort}`;
+        const parameters = [`/electronPort=${electronPort}`, `/electronWebPort=${aspCoreBackendPort}`];
         let binaryFile = manifestJsonFile.executable;
 
         const os = require('os');
@@ -102,20 +165,12 @@ function startAspCoreBackend(electronPort) {
             binaryFile = binaryFile + '.exe';
         }
 
-        const binFilePath = path.join(__dirname, 'bin', binaryFile);
-        var options = { cwd: path.join(__dirname, 'bin') };
+        let binFilePath = path.join(currentBinPath, binaryFile);
+        var options = { cwd: currentBinPath };
         apiProcess = process(binFilePath, parameters, options);
 
         apiProcess.stdout.on('data', (data) => {
             console.log(`stdout: ${data.toString()}`);
         });
-    });
+    }
 }
-
-//app.on('activate', () => {
-    // On macOS it's common to re-create a window in the app when the
-    // dock icon is clicked and there are no other windows open.
-//    if (win === null) {
-//        createWindow();
-//    }
-//});

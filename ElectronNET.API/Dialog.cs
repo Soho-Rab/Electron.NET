@@ -15,7 +15,7 @@ namespace ElectronNET.API
     public sealed class Dialog
     {
         private static Dialog _dialog;
-        private static object _syncRoot = new Object();
+        private static object _syncRoot = new object();
 
         internal Dialog() { }
 
@@ -67,8 +67,7 @@ namespace ElectronNET.API
 
             BridgeConnector.Socket.Emit("showOpenDialog",
             JObject.FromObject(browserWindow, _jsonSerializer),
-            JObject.FromObject(options, _jsonSerializer),
-            guid);
+            JObject.FromObject(options, _jsonSerializer), guid);
 
             return taskCompletionSource.Task;
         }
